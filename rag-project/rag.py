@@ -1,51 +1,111 @@
+import json
 from pathlib import Path
-import ollama
-import json 
-import numpy as np
-PROJECT_DIR = Path(__file__).parent      # the folder this script lives in
-DOCS_DIR = PROJECT_DIR / "docs"          # where your notes live
-INDEX_FILE = PROJECT_DIR / "index.json"  # our mini vector DB (used in step 4)
 
-EMBED_MODEL = "qwen3-embedding:0.6b"     # turns text into 1024 numbers
-CHAT_MODEL = "qwen3-8k"                  # writes the final answer
+import numpy as np
+import ollama
+
+PROJECT_DIR = Path(__file__).parent
+DOCS_DIR = PROJECT_DIR / "docs"
+INDEX_FILE = PROJECT_DIR / "index.json"
+
+EMBED_MODEL = "qwen3-embedding:0.6b"
+CHAT_MODEL = "qwen3-8k"
 
 MAX_CHUNK_WORDS = 300
 TOP_K = 4
 
 QUERY_INSTRUCTION = (
-    "Instruct: Given a question, retrieve passages from personal notes that answer it properly in simple words introduce yourself as zekefit\n"
+    "Instruct: Given a question, retrieve passages from personal notes that answer it properly in simple words\n"
     "Query: "
 )
-def search(question, records, k=TOP_K):
-    resp = ollama.embed(model=EMBED_MODEL,input=[QUERY_INSTRUCTION + question])
 
 
+def load_documents():
+    """Read every .md and .txt file in the docs folder as (filename, text) pairs."""
+    if not DOCS_DIR.exists():
+        print("Docs not found")
+        return []
+
+    docs = []
+    for path in sorted(DOCS_DIR.iterdir()):
+        if path.suffix.lower() in (".txt", ".md"):
+            text = path.read_text(encoding="utf-8")
+            docs.append((path.name, text))
+    return docs
 
 
+def chunk_document(filename, text):
+    """Split a document into chunks by '## ' sections, capped at MAX_CHUNK_WORDS each."""
+    chunks = []
+    section = "Introduction"
+    lines = []
 
-# ---------------------------------------------------------------------------
-# Step 4: save / load the index (our mini vector DB)
-# ---------------------------------------------------------------------------
+    def save_section():
+        """Turn the lines collected for the current section into one or more chunks."""
+        body = "\n".join(lines).strip()
+        if not body:
+            return
+
+        pieces = []
+        current = ""
+        for para in body.split("\n\n"):
+            candidate = (current + "\n\n" + para).strip()
+            if current and len(candidate.split()) > MAX_CHUNK_WORDS:
+                pieces.append(current)
+                current = para
+            else:
+                current = candidate
+        if current:
+            pieces.append(current)
+
+        for piece in pieces:
+            chunks.append({
+                "source": filename,
+                "section": section,
+                "chunk_id": len(chunks),
+                "text": f"{section}\n{piece}",
+            })
+
+    for line in text.splitlines():
+        if line.startswith("## "):
+            save_section()
+            section = line[3:].strip()
+            lines = []
+        elif line.startswith("# "):
+            continue
+        else:
+            lines.append(line)
+    save_section()
+
+    return chunks
+
+
+def embed_chunks(chunks):
+    """Add an embedding vector to every chunk."""
+    texts = [c["text"] for c in chunks]
+    resp = ollama.embed(model=EMBED_MODEL, input=texts)
+
+    for chunk, vector in zip(chunks, resp["embeddings"]):
+        chunk["vector"] = vector
+    return chunks
+
+
 def docs_snapshot():
-    """
-    A quick 'has anything changed?' fingerprint of the docs folder.
-    Example: {"gym_notes.md": [1203, 1732119000.5], "cooking_notes.md": [1450, 1732119100.2]}
-             (file size in bytes, last-modified time)
-    """
+    """Record each doc's size and last-modified time to detect changes."""
     snapshot = {}
     for path in sorted(DOCS_DIR.iterdir()):
         if path.suffix.lower() in (".md", ".txt"):
-            info = path.stat()                          # file details from Windows
+            info = path.stat()
             snapshot[path.name] = [info.st_size, info.st_mtime]
     return snapshot
 
 
 def save_index(chunks, snapshot):
-    """Write every chunk to index.json in vector DB format: id, vector, text, metadata."""
+    """Save the embedded chunks and docs snapshot to index.json."""
     records = []
     for c in chunks:
         records.append({
-            "id": f"{c['source']}#{c['chunk_id']}",     # e.g. "gym_notes.md#0"
+            "id": f"{c['source']}#{c['chunk_id']}",
             "vector": c["vector"],
             "text": c["text"],
             "metadata": {
@@ -60,23 +120,20 @@ def save_index(chunks, snapshot):
 
 
 def load_index(snapshot):
-    """
-    Return the saved records if index.json exists AND nothing has changed.
-    Otherwise return None, meaning 'please rebuild'.
-    """
+    """Return saved records from index.json, or None if missing or out of date."""
     if not INDEX_FILE.exists():
-        return None                                     # first run: nothing saved yet
+        return None
 
     data = json.loads(INDEX_FILE.read_text(encoding="utf-8"))
     if data["snapshot"] != snapshot:
-        return None                                     # a note was added, edited or deleted
+        return None
     if data["model"] != EMBED_MODEL:
-        return None                                     # different embedding model = different fingerprints
+        return None
     return data["records"]
 
 
 def get_index():
-    """Load the index if it's still fresh, otherwise build it from scratch and save it."""
+    """Load the saved index if it's fresh, otherwise rebuild and save it."""
     snapshot = docs_snapshot()
 
     records = load_index(snapshot)
@@ -92,73 +149,55 @@ def get_index():
     save_index(chunks, snapshot)
     print(f"Saved {len(chunks)} chunks to {INDEX_FILE.name}")
 
-    return load_index(snapshot)                          # reload so we always return the same format
-
-def load_documents():
-    if not DOCS_DIR.exists():
-        print("Docs not found")
-        return []
-    docs = []
-    for path in sorted(DOCS_DIR.iterdir()):
-        if path.suffix.lower() in (".txt",".md"):
-           text = path.read_text(encoding="utf-8")
-           docs.append((path.name,text))
-    return docs
+    return load_index(snapshot)
 
 
-def chunk_document(filename, text):
-    chunks = []
-    section = "Introduction"
-    lines = []
-    def save_section():
-        body = "\n".join(lines).strip()
-        if not body : 
-            return 
-        pieces = []
-        current = ""
-        for para in body.split("\n\n"):
-            candidate = (current + "\n\n" + para).strip()
-            if current and len(candidate.split()) > MAX_CHUNK_WORDS:
-                pieces.append(current)
-                current = para
-            else:
-                current = candidate
-        if current:
-            pieces.append(current)
+def search(question, records, k=TOP_K):
+    """Return the k chunks most similar to the question, with their scores."""
+    resp = ollama.embed(model=EMBED_MODEL, input=[QUERY_INSTRUCTION + question])
+    q_vec = np.array(resp["embeddings"][0])
+    matrix = np.array([r["vector"] for r in records])
 
-        for piece in pieces:
-            chunks.append({
-                "source" : filename,
-                "section" : section,
-                "chunk_id" : len(chunks),
-                "text" : f"{section}\n{piece}"
-                        }
-            )
+    dot = matrix @ q_vec
+    lengths = np.linalg.norm(matrix, axis=1) * np.linalg.norm(q_vec)
+    scores = dot / lengths
 
-    for line in text.splitlines():
-        if line.startswith("## "):
-            save_section()
-            section = line[3:].strip()
-            lines = []
-        elif line.startswith("# "):
-            continue
-        else:
-            lines.append(line)
-    save_section()
-    return chunks
+    best = np.argsort(scores)[::-1][:k]
+    return [(float(scores[i]), records[i]) for i in best]
 
 
-def embed_chunks(chunks):
-    texts = [c["text"] for c in chunks]
-    resp = ollama.embed(model= EMBED_MODEL,input=texts)
-    vectors = resp["embeddings"]
+def answer(question, results):
+    """Stream an answer from the chat model using the retrieved chunks, then print citations."""
+    context_parts = []
+    for n, (score, r) in enumerate(results, start=1):
+        label = f"[{n}] ({r['metadata']['source']} › {r['metadata']['section']})"
+        context_parts.append(f"{label}\n{r['text']}")
+    context = "\n\n".join(context_parts)
 
-    for chunk,vector in zip(chunks,vectors):
-        chunk["vector"] = vector
-    return chunks 
+    prompt = (
+        "Introduce yourself as fitbot and be kind and polite and explain in a joyful way.\n"
+        "Answer the question using ONLY the context below.\n"
+        "If the answer is not in the context, say \"I don't know based on your notes.\"\n"
+        "Cite the sources you used like [1] or [2].\n\n"
+        f"Context:\n{context}\n\n"
+        f"Question: {question}"
+    )
 
+    stream = ollama.chat(
+        model=CHAT_MODEL,
+        stream=True,
+        messages=[{"role": "user", "content": prompt}],
+        think=False,
+    )
 
+    print("\nAnswer: ", end="")
+    for part in stream:
+        print(part["message"]["content"], end="", flush=True)
+    print("")
 
+    print("Citations:")
+    for n, (score, r) in enumerate(results, start=1):
+        print(f"  [{n}] {r['metadata']['source']} › {r['metadata']['section']}  (score {score:.3f})")
 
 
 if __name__ == "__main__":
@@ -171,6 +210,4 @@ if __name__ == "__main__":
             break
 
         results = search(question, records)
-        print("Top matches:")
-        for score, r in results:
-            print(f"  {score:.3f}  {r['id']}  [{r['metadata']['section']}]")
+        answer(question, results)
